@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 # coding: utf-8
 
-# In[1]:
+# In[6]:
 
 
 import numpy as np
@@ -20,26 +20,32 @@ from prompt_toolkit import prompt
 from prompt_toolkit.completion import WordCompleter
 
 
-# In[2]:
+# In[16]:
 
 
-class CbowEmbedding(nn.Module):
-    def __init__(self, vocab_size, embedding_dim, winlen):
+class KREmbedding(nn.Module):
+    def __init__(self, vocab_size, embedding_dim, sigma=1.0):
         super().__init__()
         self.embedding_weights = nn.Parameter(torch.randn(vocab_size, embedding_dim, dtype = torch.float32, device = device) * (1.0 / embedding_dim ** 0.5))
-        self.fc = nn.Linear(embedding_dim, vocab_size)
+        self.sigma = sigma
 
-    def forward(self, context):
+    def forward(self, context, center):
         context_vecs = self.embedding_weights[context] # batch_size * (winlen - 1) * embedding
-        avg_vecs = context_vecs.mean(dim = 1)
-        output = self.fc(avg_vecs)
-        return output
+        center_vec = self.embedding_weights[center] # batch_size * embedding
+        diff = context_vecs - center_vec.unsqueeze(1)  # batch_size * (winlen - 1) * embedding
+        dist_sq = torch.sum(diff ** 2, dim=2)  # batch_size * (winlen - 1)
+        weights = torch.exp(-dist_sq / (2 * self.sigma ** 2))  # batch_size * (winlen - 1)
+        weights = weights / (weights.sum(dim=1, keepdim=True) + 1e-8)  # batch_size * (winlen - 1)
+        weighted_context = (weights.unsqueeze(2) * context_vecs).sum(dim=1)  # batch_size * embedding
+
+        similarity_matrix = torch.mm(weighted_context, self.embedding_weights.t())
+        return similarity_matrix # compare to embeddings and output logits
     
     def getEmbedding(self, id):
         return self.embedding_weights[id]
+# still stemming (use better tool), negative sampling
 
-
-# In[3]:
+# In[8]:
 
 
 class CorpusDataset(Dataset):
@@ -54,7 +60,7 @@ class CorpusDataset(Dataset):
         return self.data[idx], self.labels[idx]
 
 
-# In[ ]:
+# In[9]:
 
 
 def preprocessing(text, min_count = 15, threshold = 1e-5):
@@ -103,7 +109,7 @@ print(context_train.shape, center_train.shape, vocab_size)
 # In[ ]:
 
 
-def train(model, optimizer, context_train, center_train):
+def train(model, optimizer, dataloader):
     criterion = nn.CrossEntropyLoss()
     num_epoches = 100
 
@@ -120,7 +126,7 @@ def train(model, optimizer, context_train, center_train):
             optimizer.zero_grad()
             
             # Forward pass
-            output = model(batch_context)
+            output = model(batch_context, batch_center)
             target = batch_center.long()
             
             # Compute loss
@@ -145,22 +151,14 @@ def train(model, optimizer, context_train, center_train):
     return model, optimizer
 
 
-# In[ ]:
+# In[31]:
 
 
 device = torch.device("cuda:1" if torch.cuda.is_available() else "cpu")
 print(device)
-model = CbowEmbedding(vocab_size, 256, 7).to(device)
-model.embedding_weights.to(device)
+model = KREmbedding(vocab_size, 256, 7).to(device)
 optimizer = optim.Adam(model.parameters(), lr=0.01)
 
-
-# In[ ]:
-
-
-# current_model = torch.load("model-103.pth", map_location='cpu')
-# model.load_state_dict(current_model["state_dict"])
-# optimizer.load_state_dict(current_model["optimizer"])
 
 # In[ ]:
 
@@ -176,10 +174,10 @@ print(len(dataloader))
 
 for name, param in model.named_parameters():
     print(f"{name}: {param.shape} | Device: {param.device}")
-model, optimizer = train(model, optimizer, context_train, center_train)
+model, optimizer = train(model, optimizer, dataloader)
 
 
-# In[23]:
+# In[ ]:
 
 
 model.eval()
@@ -196,7 +194,7 @@ with open("output-cbow.txt", 'w') as f:
         f.write('\n')
 
 
-# In[35]:
+# In[ ]:
 
 
 def getClose(target, k = 5):
@@ -209,9 +207,6 @@ def getClose(target, k = 5):
 
     res = sorted(sims, key=lambda x : x[1], reverse = True)
     return [_[0] for _ in res[:k]]
-
-
-# In[ ]:
 
 
 import random
@@ -239,17 +234,13 @@ for q in qs_s[:100]:
 
 print(correctCount, totalCount)
 
-
-# In[ ]:
-
-
 state = {
     "state_dict" : model.state_dict(),  # model parameters
     "optimizer" : optimizer.state_dict(),  # optimizer state
     "word2id" : word2id, 
     "id2word" : id2word
 }
-torch.save(state, 'model-103.pth')
+torch.save(state, 'model-k103.pth')
 
 
 # In[ ]:
@@ -262,7 +253,7 @@ while True:
     cc = int(input("Input closest count: "))
     try:
         embed = word2embed[word]
-        print(*getClose(embed, cc))
+        print(embed, *getClose(embed, cc))
     except KeyError:
         print("Nonexistent word.")
 

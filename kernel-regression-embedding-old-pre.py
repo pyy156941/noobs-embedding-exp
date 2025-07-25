@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 # coding: utf-8
 
-# In[1]:
+# In[ ]:
 
 
 import numpy as np
@@ -9,6 +9,7 @@ import re
 import torch
 import torch.nn as nn
 import torch.optim as optim
+import torch.nn.functional as F
 import matplotlib.pyplot as plt
 from torch.utils.data import DataLoader, Dataset
 
@@ -19,27 +20,40 @@ from collections import Counter
 from prompt_toolkit import prompt
 from prompt_toolkit.completion import WordCompleter
 
+from gensim.utils import simple_preprocess
+import spacy
 
-# In[2]:
+torch.backends.cudnn.benchmark = True
+nlp = spacy.load("en_core_web_sm", disable=["parser", "ner", "tagger"])
+nlp.max_length = 100_000_0000
 
 
-class CbowEmbedding(nn.Module):
-    def __init__(self, vocab_size, embedding_dim, winlen):
+# In[ ]:
+
+
+class KREmbedding(nn.Module):
+    def __init__(self, vocab_size, embedding_dim, sigma=1.0):
         super().__init__()
         self.embedding_weights = nn.Parameter(torch.randn(vocab_size, embedding_dim, dtype = torch.float32, device = device) * (1.0 / embedding_dim ** 0.5))
-        self.fc = nn.Linear(embedding_dim, vocab_size)
+        self.sigma = sigma
 
-    def forward(self, context):
+    def forward(self, context, center):
         context_vecs = self.embedding_weights[context] # batch_size * (winlen - 1) * embedding
-        avg_vecs = context_vecs.mean(dim = 1)
-        output = self.fc(avg_vecs)
-        return output
+        center_vec = self.embedding_weights[center] # batch_size * embedding
+        diff = context_vecs - center_vec.unsqueeze(1)  # batch_size * (winlen - 1) * embedding
+        dist_sq = torch.sum(diff ** 2, dim=2)  # batch_size * (winlen - 1)
+        weights = torch.exp(-dist_sq / (2 * self.sigma ** 2))  # batch_size * (winlen - 1)
+        weights = weights / (weights.sum(dim=1, keepdim=True) + 1e-8)  # batch_size * (winlen - 1)
+        weighted_context = (weights.unsqueeze(2) * context_vecs).sum(dim=1)  # batch_size * embedding
+
+        similarity_matrix = torch.mm(weighted_context, self.embedding_weights.t())
+        return similarity_matrix # compare to embeddings and output logits
     
     def getEmbedding(self, id):
         return self.embedding_weights[id]
 
 
-# In[3]:
+# In[8]:
 
 
 class CorpusDataset(Dataset):
@@ -57,25 +71,39 @@ class CorpusDataset(Dataset):
 # In[ ]:
 
 
-def preprocessing(text, min_count = 15, threshold = 1e-5):
-    _ = re.findall(r"[A-Za-z]+", text)
-    words = []
-    for word in _:
-        words.append(word.lower())
-    word_counts = Counter(words)
-    words = [word for word in words if word_counts[word] >= min_count]
-
-    sub_words = []
-    for word in words:
-        freq = word_counts[word] / len(words)
-        discard_prob = 1.0 - np.sqrt(threshold / freq)
-
-        if np.random.rand() > discard_prob:
-            sub_words.append(word)
-
-    word2id = {w : i for i, w in enumerate(set(sub_words))}
-    id2word = {i : w for _, (w, i) in enumerate(word2id.items())}
-    return words, word2id, id2word
+def preprocessing(text, min_count=5, threshold=1e-5, chunk_size=500000):
+    # Stage 1: Fast Gensim cleaning (memory-safe)
+    words = simple_preprocess(text, deacc=True, min_len=2)
+    
+    # Stage 2: Chunked SpaCy lemmatization
+    def process_chunk(chunk):
+        doc = nlp(" ".join(chunk))
+        return [
+            token.lemma_ for token in doc
+            if token.is_alpha and not token.is_punct and len(token) > 1
+        ]
+    
+    # Split words into chunks to avoid SpaCy memory issues
+    lemmatized = []
+    for i in range(0, len(words), chunk_size):
+        chunk = words[i : i + chunk_size]
+        lemmatized.extend(process_chunk(chunk))
+    
+    # Stage 3: Subsampling (Word2Vec style)
+    word_counts = Counter(lemmatized)
+    total_words = len(lemmatized)
+    subsampled = [
+        word for word in lemmatized
+        if word_counts[word] >= min_count and 
+            np.random.rand() > (1 - np.sqrt(threshold / (word_counts[word]/total_words)))
+    ]
+    
+    # Build vocab
+    vocab = list(set(subsampled))
+    word2id = {w: i for i, w in enumerate(vocab)}
+    id2word = {i: w for i, w in enumerate(vocab)}
+    
+    return subsampled, word2id, id2word
 
 def generateData(words, word2id, winlen): # winlen must be odd
     vocab_size = len(word2id)
@@ -103,7 +131,7 @@ print(context_train.shape, center_train.shape, vocab_size)
 # In[ ]:
 
 
-def train(model, optimizer, context_train, center_train):
+def train(model, optimizer, dataloader):
     criterion = nn.CrossEntropyLoss()
     num_epoches = 100
 
@@ -112,7 +140,7 @@ def train(model, optimizer, context_train, center_train):
         model.train()
         epoch_loss = 0.0
         
-        for batch_context, batch_center in tqdm(dataloader, desc=f'Epoch {epoch+1}/{num_epoches}', leave=False):
+        for batch_context, batch_center in tqdm(dataloader, desc=f'Epoch {epoch+1}/{num_epoches}'):
             # Move data to device
             batch_context = batch_context.to(device)
             batch_center = batch_center.to(device)
@@ -120,7 +148,7 @@ def train(model, optimizer, context_train, center_train):
             optimizer.zero_grad()
             
             # Forward pass
-            output = model(batch_context)
+            output = model(batch_context, batch_center)
             target = batch_center.long()
             
             # Compute loss
@@ -148,19 +176,11 @@ def train(model, optimizer, context_train, center_train):
 # In[ ]:
 
 
-device = torch.device("cuda:1" if torch.cuda.is_available() else "cpu")
+device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 print(device)
-model = CbowEmbedding(vocab_size, 256, 7).to(device)
-model.embedding_weights.to(device)
+model = KREmbedding(vocab_size, 256, 7).to(device)
 optimizer = optim.Adam(model.parameters(), lr=0.01)
 
-
-# In[ ]:
-
-
-# current_model = torch.load("model-103.pth", map_location='cpu')
-# model.load_state_dict(current_model["state_dict"])
-# optimizer.load_state_dict(current_model["optimizer"])
 
 # In[ ]:
 
@@ -176,10 +196,10 @@ print(len(dataloader))
 
 for name, param in model.named_parameters():
     print(f"{name}: {param.shape} | Device: {param.device}")
-model, optimizer = train(model, optimizer, context_train, center_train)
+model, optimizer = train(model, optimizer, dataloader)
 
 
-# In[23]:
+# In[ ]:
 
 
 model.eval()
@@ -196,7 +216,7 @@ with open("output-cbow.txt", 'w') as f:
         f.write('\n')
 
 
-# In[35]:
+# In[ ]:
 
 
 def getClose(target, k = 5):
@@ -209,9 +229,6 @@ def getClose(target, k = 5):
 
     res = sorted(sims, key=lambda x : x[1], reverse = True)
     return [_[0] for _ in res[:k]]
-
-
-# In[ ]:
 
 
 import random
@@ -239,17 +256,13 @@ for q in qs_s[:100]:
 
 print(correctCount, totalCount)
 
-
-# In[ ]:
-
-
 state = {
     "state_dict" : model.state_dict(),  # model parameters
     "optimizer" : optimizer.state_dict(),  # optimizer state
     "word2id" : word2id, 
     "id2word" : id2word
 }
-torch.save(state, 'model-103.pth')
+torch.save(state, 'model-kop103.pth')
 
 
 # In[ ]:
@@ -262,7 +275,7 @@ while True:
     cc = int(input("Input closest count: "))
     try:
         embed = word2embed[word]
-        print(*getClose(embed, cc))
+        print(embed, *getClose(embed, cc))
     except KeyError:
         print("Nonexistent word.")
 

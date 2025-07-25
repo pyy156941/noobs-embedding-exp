@@ -1,5 +1,4 @@
 #!/usr/bin/env python
-# coding: utf-8
 import numpy as np
 import re
 import torch
@@ -15,29 +14,34 @@ from collections import Counter
 from prompt_toolkit import prompt
 from prompt_toolkit.completion import WordCompleter
 
-class CbowEmbedding(nn.Module):
-    def __init__(self, vocab_size, embedding_dim, winlen):
+class KREmbedding(nn.Module):
+    def __init__(self, vocab_size, embedding_dim, sigma=1.0):
         super().__init__()
-        self.embedding_weights = nn.Parameter(torch.randn(vocab_size, embedding_dim, dtype = torch.float32, device = device) * (1.0 / embedding_dim ** 0.5))
-        self.fc = nn.Linear(embedding_dim, vocab_size)
+        self.embedding_weights = nn.Parameter(torch.randn(vocab_size, embedding_dim, dtype = torch.float32))
+        self.sigma = sigma
 
-    def forward(self, context):
+    def forward(self, context, center):
         context_vecs = self.embedding_weights[context] # batch_size * (winlen - 1) * embedding
-        avg_vecs = context_vecs.mean(dim = 1)
-        output = self.fc(avg_vecs)
-        return output
+        center_vec = self.embedding_weights[center] # batch_size * embedding
+        diff = context_vecs - center_vec.unsqueeze(1)  # batch_size * (winlen - 1) * embedding
+        dist_sq = torch.sum(diff ** 2, dim=2)  # batch_size * (winlen - 1)
+        weights = torch.exp(-dist_sq / (2 * self.sigma ** 2))  # batch_size * (winlen - 1)
+        weights = weights / (weights.sum(dim=1, keepdim=True) + 1e-8)  # batch_size * (winlen - 1)
+        weighted_context = (weights.unsqueeze(2) * context_vecs).sum(dim=1)  # batch_size * embedding
+
+        return weighted_context
     
     def getEmbedding(self, id):
         return self.embedding_weights[id]
 
 device = torch.device("cuda:1" if torch.cuda.is_available() else "cpu")
-current_model = torch.load("model-103.pth", map_location=device)
+current_model = torch.load("model-k103.pth", map_location=device)
 word2id = current_model["word2id"]
 id2word = current_model["id2word"]
 vocab_size = len(word2id)
 
 print(device)
-model = CbowEmbedding(vocab_size, 256, 7).to(device)
+model = KREmbedding(vocab_size, 256, 7).to(device)
 model.embedding_weights.to(device)
 optimizer = optim.Adam(model.parameters(), lr=0.01)
 model.load_state_dict(current_model["state_dict"])
@@ -82,7 +86,7 @@ with open("questions-words.txt", 'r') as f:
 qs_s = qs.split('\n')
 random.shuffle(qs_s)
 
-for q in tqdm(qs_s[:5]):
+for q in tqdm(qs_s):
     words = q.split()
     if len(words) != 4:
         continue
@@ -97,7 +101,7 @@ for q in tqdm(qs_s[:5]):
     except KeyError:
         pass
 
-print(correctCount, totalCount) # 7191 17776 7422 17776
+print(correctCount, totalCount) # 7191 17776 7422 17776 10268 17776
 
 def tc(word):
     if word.lower() in word2embed:
